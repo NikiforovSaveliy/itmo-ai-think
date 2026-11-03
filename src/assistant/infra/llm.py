@@ -9,6 +9,7 @@ import hashlib
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TypedDict
 
 import httpx
 
@@ -41,16 +42,28 @@ class LLMResponse:
                 {
                     "id": call.id,
                     "type": "function",
-                    "function": {"name": call.name, "arguments": json.dumps(call.arguments, ensure_ascii=False)},
+                    "function": {
+                        "name": call.name,
+                        "arguments": json.dumps(call.arguments, ensure_ascii=False),
+                    },
                 }
                 for call in self.tool_calls
             ]
         return message
 
 
+class ChatMessage(TypedDict):
+    role: str
+    content: str
+
+
 def tool_message(call: ToolCall, result: dict) -> dict:
     """Сообщение с результатом инструмента для истории диалога."""
-    return {"role": "tool", "tool_call_id": call.id, "content": json.dumps(result, ensure_ascii=False)}
+    return {
+        "role": "tool",
+        "tool_call_id": call.id,
+        "content": json.dumps(result, ensure_ascii=False),
+    }
 
 
 @dataclass
@@ -79,12 +92,14 @@ class LLMClient:
         self.cache_dir = Path(cache_dir) if cache_dir else None
         self.stats = LLMStats()
         self._http = http or httpx.Client(
-            base_url=base_url.rstrip("/"), headers={"Authorization": f"Bearer {api_key}"}, timeout=600
+            base_url=base_url.rstrip("/"),
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=600,
         )
 
     def chat(
         self,
-        messages: list[dict],
+        messages: list[dict] | list[ChatMessage],
         *,
         tools: list[dict] | None = None,
         json_schema: dict | None = None,
@@ -106,13 +121,19 @@ class LLMClient:
         if tools:
             body["tools"] = tools
         if json_schema:
-            body["response_format"] = {"type": "json_schema", "json_schema": {"name": "answer", "schema": json_schema}}
+            body["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {"name": "answer", "schema": json_schema},
+            }
         data = self._cached("chat/completions", body)
         message = data["choices"][0]["message"]
         usage = data.get("usage") or {}
         response = LLMResponse(
             content=message.get("content") or "",
-            tool_calls=[_parse_call(raw, i) for i, raw in enumerate(message.get("tool_calls") or [])],
+            tool_calls=[
+                _parse_call(raw, i)
+                for i, raw in enumerate(message.get("tool_calls") or [])
+            ],
             prompt_tokens=usage.get("prompt_tokens", 0),
             completion_tokens=usage.get("completion_tokens", 0),
         )
@@ -126,17 +147,22 @@ class LLMClient:
         vectors: dict[str, list[float]] = {}
         missing: list[str] = []
         for text in dict.fromkeys(texts):
-            cached = self._read(self._key("embeddings", {"model": self.embed_model, "input": text}))
+            cached = self._read(
+                self._key("embeddings", {"model": self.embed_model, "input": text})
+            )
             if cached is None:
                 missing.append(text)
             else:
                 vectors[text] = cached["embedding"]
         if missing:
-            data = self._post("embeddings", {"model": self.embed_model, "input": missing})
+            data = self._post(
+                "embeddings", {"model": self.embed_model, "input": missing}
+            )
             for text, row in zip(missing, data["data"], strict=True):
                 vectors[text] = row["embedding"]
                 self._write(
-                    self._key("embeddings", {"model": self.embed_model, "input": text}), {"embedding": row["embedding"]}
+                    self._key("embeddings", {"model": self.embed_model, "input": text}),
+                    {"embedding": row["embedding"]},
                 )
         return [vectors[text] for text in texts]
 
@@ -158,12 +184,16 @@ class LLMClient:
                 f"сервис модели недоступен ({exc}). Проверьте, что он запущен, и адрес LLM_BASE_URL"
             ) from exc
         if response.status_code != 200:
-            raise LLMError(f"сервис модели ответил кодом {response.status_code}: {response.text[:300]}")
+            raise LLMError(
+                f"сервис модели ответил кодом {response.status_code}: {response.text[:300]}"
+            )
         return response.json()
 
     @staticmethod
     def _key(path: str, body: dict) -> str:
-        raw = json.dumps({"path": path, "body": body}, ensure_ascii=False, sort_keys=True)
+        raw = json.dumps(
+            {"path": path, "body": body}, ensure_ascii=False, sort_keys=True
+        )
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
     def _read(self, key: str) -> dict | None:
@@ -176,7 +206,9 @@ class LLMClient:
         if self.cache_dir is None:
             return
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        (self.cache_dir / f"{key}.json").write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        (self.cache_dir / f"{key}.json").write_text(
+            json.dumps(data, ensure_ascii=False), encoding="utf-8"
+        )
 
 
 def _parse_call(raw: dict, index: int) -> ToolCall:
@@ -189,4 +221,6 @@ def _parse_call(raw: dict, index: int) -> ToolCall:
             arguments = {"_raw": arguments}
     if not isinstance(arguments, dict):
         arguments = {"_raw": arguments}
-    return ToolCall(raw.get("id") or f"call_{index}", function.get("name", ""), arguments)
+    return ToolCall(
+        raw.get("id") or f"call_{index}", function.get("name", ""), arguments
+    )
