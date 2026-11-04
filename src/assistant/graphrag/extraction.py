@@ -7,7 +7,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError, field_validator, mo
 
 from assistant.infra import schemas
 from assistant.infra.config import vocabulary
-from assistant.infra.grounding import CODE_TYPES, canonical_name, find_codes
+from assistant.infra.grounding import CODE_TYPES, canonical_name, code_type, find_codes
 from assistant.infra.llm import ChatMessage, LLMClient
 
 
@@ -143,6 +143,30 @@ def _ground_entity(
     return schemas.Entity(entity_type, name)
 
 
+def _installed_parts(text: str) -> list[schemas.Relation]:
+    """Извлекает связи HAS_PART из явного списка установленных узлов"""
+    _, heading, section = text.partition("\n## Состав узлов\n")
+    if not heading:
+        return []
+
+    introduction, *rows = section.split("\n## ", 1)[0].strip().splitlines() or [""]
+    if not introduction.startswith("В ") or not introduction.endswith(" установлены следующие узлы."):
+        return []
+    model_codes = find_codes(introduction)
+    if len(model_codes) != 1 or code_type(model_codes[0]) != "Model":
+        return []
+
+    model = schemas.Entity("Model", model_codes[0])
+    relations = []
+    for row in rows:
+        if not row.startswith("- "):
+            continue
+        part_codes = find_codes(row)
+        if len(part_codes) == 1 and code_type(part_codes[0]) == "Part":
+            relations.append(schemas.Relation(model, "HAS_PART", schemas.Entity("Part", part_codes[0])))
+    return relations
+
+
 def _ground_response(
     response: ExtractionResponse, chunk: schemas.Chunk, names: dict[str, list[str]]
 ) -> schemas.ExtractionResult:
@@ -171,6 +195,10 @@ def _ground_response(
             continue
         # Модель может указать подтвержденную сущность только в конце связи.
         entities.extend((subject, target))
+        relations.append(relation)
+
+    for relation in _installed_parts(chunk.text):
+        entities.extend((relation.subject, relation.object))
         relations.append(relation)
 
     result.entities = list(dict.fromkeys(entities))
