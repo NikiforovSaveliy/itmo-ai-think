@@ -3,10 +3,11 @@
 from itertools import combinations
 
 import networkx as nx
+from pydantic import BaseModel, Field, ValidationError
 
 from assistant.infra.grounding import code_type, find_codes, find_names
 from assistant.infra.llm import LLMClient
-from assistant.infra.schemas import Answer, Entity, KnowledgeBase
+from assistant.infra.schemas import MAP_SCHEMA, Answer, Entity, KnowledgeBase
 
 _MAX_FACT_CHARS = 8000
 _NO_FACTS = "В базе знаний не найдено."
@@ -16,6 +17,11 @@ _LOCAL_PROMPT = (
     "от старой детали к последней замене. "
     f"Если фактов недостаточно, ответь: «{_NO_FACTS}»"
 )
+
+
+class _PartialAnswer(BaseModel):
+    answer: str
+    score: int = Field(strict=True, ge=0, le=10)
 
 
 def _local_edges(graph: nx.DiGraph, anchors: list[str]) -> set[tuple[str, str]]:
@@ -104,11 +110,52 @@ def local_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
 
 
 def global_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
-    """Отвечает на обзорный вопрос по сводкам сообществ в два шага.
+    """Отвечает на обзорный вопрос по сводкам сообществ в два шага"""
+    partials: list[str] = []
+    sources: set[str] = set()
+    for community in kb.communities:
+        response = llm.chat(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "Ответь на вопрос по одной сводке. Сохрани относящиеся к вопросу факты и числа. "
+                        "Верни JSON с полями answer и score. Оцени полезность от 0 до 10. "
+                        "Поставь 0, если в сводке нет полезных фактов."
+                    ),
+                },
+                {"role": "user", "content": f"Вопрос: {question}\n\nСводка:\n{community.summary}"},
+            ],
+            json_schema=MAP_SCHEMA,
+        )
+        try:
+            partial = _PartialAnswer.model_validate_json(response.content)
+        except ValidationError:
+            continue
+        if partial.score == 0 or not partial.answer.strip():
+            continue
+        partials.append(partial.answer.strip())
+        for node in community.nodes:
+            sources.update(chunk.split("#", 1)[0] for chunk in kb.graph.nodes[node]["sources"])
 
-    Шаг map: для каждой сводки модель даёт частичный ответ и оценку полезности от 0 до 10.
-    Шаг reduce: частичные ответы с оценкой выше 0 объединяются в итоговый ответ.
-    Если таких ответов нет, возвращается `Answer(..., refused=True)`.
-    """
-    # TODO: частичные ответы по сводкам, объединение
-    raise NotImplementedError("Реализуйте global_search")
+    if not partials:
+        return Answer(_NO_FACTS, refused=True)
+
+    answers = "\n".join(f"{index}. {answer}" for index, answer in enumerate(partials, start=1))
+    response = llm.chat(
+        [
+            {
+                "role": "system",
+                "content": (
+                    "Объедини частичные ответы в один ответ по-русски. "
+                    "Используй только данные из частичных ответов и не учитывай один факт дважды. "
+                    f"Если данных недостаточно, ответь: «{_NO_FACTS}»"
+                ),
+            },
+            {"role": "user", "content": f"Вопрос: {question}\n\nЧастичные ответы:\n{answers}"},
+        ]
+    )
+    text = response.content.strip()
+    if not text or _NO_FACTS.rstrip(".").casefold() in text.casefold():
+        return Answer(_NO_FACTS, refused=True)
+    return Answer(text, sources=sorted(sources))
