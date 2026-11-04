@@ -1,6 +1,7 @@
 """Извлечение сущностей и связей из чанка. Требование FR-1."""
 
 import json
+import re
 from typing import Self
 
 from pydantic import BaseModel, ConfigDict, ValidationError, field_validator, model_validator
@@ -167,6 +168,22 @@ def _installed_parts(text: str) -> list[schemas.Relation]:
     return relations
 
 
+def _line_memberships(text: str, names: dict[str, list[str]]) -> list[schemas.Relation]:
+    """Извлекает принадлежность модели к линейке из прямого утверждения."""
+    lines = {name.casefold(): name for name in names.get("ProductLine", [])}
+    relations = []
+    for raw_model, raw_line in re.findall(
+        r"\b([A-Z]{2}[- ]?\d{3})\s+входит в линейку «([^»]+)»", text, flags=re.IGNORECASE
+    ):
+        codes = find_codes(raw_model)
+        line = lines.get(raw_line.casefold())
+        if len(codes) == 1 and code_type(codes[0]) == "Model" and line is not None:
+            relations.append(
+                schemas.Relation(schemas.Entity("Model", codes[0]), "BELONGS_TO", schemas.Entity("ProductLine", line))
+            )
+    return relations
+
+
 def _ground_response(
     response: ExtractionResponse, chunk: schemas.Chunk, names: dict[str, list[str]]
 ) -> schemas.ExtractionResult:
@@ -197,7 +214,7 @@ def _ground_response(
         entities.extend((subject, target))
         relations.append(relation)
 
-    for relation in _installed_parts(chunk.text):
+    for relation in _installed_parts(chunk.text) + _line_memberships(chunk.text, names):
         entities.extend((relation.subject, relation.object))
         relations.append(relation)
 

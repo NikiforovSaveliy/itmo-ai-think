@@ -149,16 +149,6 @@ def _line_models(graph: nx.DiGraph, lines: set[str]) -> set[str]:
     }
 
 
-def _global_communities(question: str, kb: KnowledgeBase) -> list[Community]:
-    """Выбирает сообщества названных линеек и связанных с ними моделей."""
-    lines = _product_lines(question, kb)
-    if not lines:
-        return kb.communities
-
-    relevant_nodes = lines | _line_models(kb.graph, lines)
-    return [community for community in kb.communities if relevant_nodes.intersection(community.nodes)]
-
-
 def _line_facts(graph: nx.DiGraph, models: set[str]) -> tuple[list[str], set[str], set[str]]:
     """Собирает итоги отказов и связи замен по моделям выбранных линеек."""
     model_failures: Counter[str] = Counter()
@@ -188,7 +178,7 @@ def _line_facts(graph: nx.DiGraph, models: set[str]) -> tuple[list[str], set[str
     facts = [f"Отказы модели {model}: {count}" for model, count in model_failures.items()]
     facts.extend(f"Отказы узла «{component}»: {count}" for component, count in component_failures.most_common())
     facts.extend(
-        f"Модель {model}: исходная деталь {old_part}, замена {new_part}."
+        f"Модель {model}: исходная деталь {old_part} снята с производства, замена {new_part}."
         for model, old_part, new_part in sorted(replacements)
     )
     return facts, sources, codes
@@ -206,19 +196,41 @@ def global_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
     partials: list[str] = []
     sources: set[str] = set()
     known_codes: set[str] = set()
-    communities = _global_communities(question, kb)
-    for community in communities:
+    lines = _product_lines(question, kb)
+    models = _line_models(kb.graph, lines)
+    scope = lines | models
+    facts, graph_sources, graph_codes = _line_facts(kb.graph, models)
+    graph_context = "\n".join(facts)
+    for community in kb.communities:
+        in_scope = not scope or bool(scope.intersection(community.nodes))
+        context = f"Вопрос: {question}\n\nСводка:\n{community.summary}"
+        if not in_scope:
+            context += "\n\nСводка вне выбранной линейки. Верни пустой ответ с оценкой 0."
+        elif facts:
+            context += (
+                "\n\nПроверенные данные графа по выбранной линейке:\n"
+                f"{graph_context}\n"
+                "При расхождении чисел используй данные графа. "
+                "Различай отказы моделей и узлов, а также исходные детали и замены."
+            )
         response = llm.chat(
             [
                 {
                     "role": "system",
                     "content": (
+                        "Ответь на вопрос по одной сводке и приложенным фактам. "
+                        "Сохрани относящиеся к вопросу факты и числа. "
+                        "Верни JSON с полями answer и score. Оцени полезность от 0 до 10. "
+                        "Поставь 0, если данных недостаточно."
+                    )
+                    if scope
+                    else (
                         "Ответь на вопрос по одной сводке. Сохрани относящиеся к вопросу факты и числа. "
                         "Верни JSON с полями answer и score. Оцени полезность от 0 до 10. "
                         "Поставь 0, если в сводке нет полезных фактов."
                     ),
                 },
-                {"role": "user", "content": f"Вопрос: {question}\n\nСводка:\n{community.summary}"},
+                {"role": "user", "content": context},
             ],
             json_schema=MAP_SCHEMA,
         )
@@ -226,21 +238,19 @@ def global_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
             partial = _PartialAnswer.model_validate_json(response.content)
         except ValidationError:
             continue
-        if partial.score == 0 or not partial.answer.strip():
+        if not in_scope or partial.score == 0 or not partial.answer.strip():
             continue
         partials.append(partial.answer.strip())
         known_codes.update(_community_codes(kb, community))
         for node in community.nodes:
             sources.update(chunk.split("#", 1)[0] for chunk in kb.graph.nodes[node]["sources"])
 
-    models = _line_models(kb.graph, _product_lines(question, kb))
-    facts, graph_sources, graph_codes = _line_facts(kb.graph, models)
-    if not partials and not facts:
+    if not partials:
         return Answer(_NO_FACTS, refused=True)
 
     answers = "\n".join(f"{index}. {answer}" for index, answer in enumerate(partials, start=1))
-    if len(communities) == 1:
-        answers += f"\n\nСводка, подтверждающая частичный ответ:\n{communities[0].summary}"
+    if not facts and len(kb.communities) == 1:
+        answers += f"\n\nСводка, подтверждающая частичный ответ:\n{kb.communities[0].summary}"
     system_prompt = (
         "Объедини частичные ответы в один ответ по-русски. "
         "Опирайся на частичные ответы и приложенную сводку, если она есть. "
@@ -248,7 +258,7 @@ def global_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
         f"Если данных недостаточно, ответь: «{_NO_FACTS}»"
     )
     if facts:
-        answers += "\n\nПроверенные данные графа по выбранной линейке:\n" + "\n".join(facts)
+        answers += "\n\nПроверенные данные графа по выбранной линейке:\n" + graph_context
         system_prompt += (
             " Для статистики отказов и замен используй прежде всего проверенные данные графа. "
             "Различай итоги по моделям и по узлам, исходные детали и их замены. "
