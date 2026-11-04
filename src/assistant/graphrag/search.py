@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from assistant.infra.grounding import code_type, find_codes, find_names
 from assistant.infra.llm import LLMClient
-from assistant.infra.schemas import MAP_SCHEMA, Answer, Entity, KnowledgeBase
+from assistant.infra.schemas import MAP_SCHEMA, Answer, Community, Entity, KnowledgeBase
 
 _MAX_FACT_CHARS = 8000
 _NO_FACTS = "В базе знаний не найдено."
@@ -114,11 +114,32 @@ def local_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
     return Answer(text, sources=sources, facts=facts)
 
 
+def _global_communities(question: str, kb: KnowledgeBase) -> list[Community]:
+    """Выбирает сообщества названных линеек и связанных с ними моделей."""
+    lines = {
+        Entity(kind, name).node_id
+        for kind, name in find_names(question, {"ProductLine": kb.vocabulary.get("ProductLine", [])})
+    }
+    if not lines:
+        return kb.communities
+
+    models = {
+        model
+        for line in lines
+        if line in kb.graph
+        for model, _, attrs in kb.graph.in_edges(line, data=True)
+        if attrs["type"] == "BELONGS_TO"
+    }
+    relevant_nodes = lines | models
+    return [community for community in kb.communities if relevant_nodes.intersection(community.nodes)]
+
+
 def global_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
     """Отвечает на обзорный вопрос по сводкам сообществ в два шага"""
     partials: list[str] = []
     sources: set[str] = set()
-    for community in kb.communities:
+    communities = _global_communities(question, kb)
+    for community in communities:
         response = llm.chat(
             [
                 {
@@ -147,13 +168,16 @@ def global_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
         return Answer(_NO_FACTS, refused=True)
 
     answers = "\n".join(f"{index}. {answer}" for index, answer in enumerate(partials, start=1))
+    if len(communities) == 1:
+        answers += f"\n\nСводка, подтверждающая частичный ответ:\n{communities[0].summary}"
     response = llm.chat(
         [
             {
                 "role": "system",
                 "content": (
                     "Объедини частичные ответы в один ответ по-русски. "
-                    "Используй только данные из частичных ответов и не учитывай один факт дважды. "
+                    "Опирайся на частичные ответы и приложенную сводку, если она есть. "
+                    "Не учитывай один факт дважды. "
                     f"Если данных недостаточно, ответь: «{_NO_FACTS}»"
                 ),
             },
