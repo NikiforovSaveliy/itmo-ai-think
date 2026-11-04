@@ -1,14 +1,14 @@
 """Извлечение сущностей и связей из чанка. Требование FR-1."""
 
 import json
-
-from assistant.infra.config import vocabulary
-from assistant.infra.llm import ChatMessage, LLMClient
-from assistant.infra import schemas
-
-
-from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 from typing import Self
+
+from pydantic import BaseModel, ConfigDict, ValidationError, field_validator, model_validator
+
+from assistant.infra import schemas
+from assistant.infra.config import vocabulary
+from assistant.infra.grounding import CODE_TYPES, canonical_name, find_codes
+from assistant.infra.llm import ChatMessage, LLMClient
 
 
 class ExtractionResponse(BaseModel):
@@ -37,14 +37,11 @@ class ExtractionResponse(BaseModel):
         object: str
 
         @model_validator(mode="after")
-        def validate_signature(self) -> Self:
-            expected = schemas.RELATION_SIGNATURES.get(self.type)
-
-            if expected != (self.subject_type, self.object_type):
-                raise ValueError(
-                    f"Invalid relation signature: "
-                    f"{self.subject_type} -[{self.type}]-> {self.object_type}"
-                )
+        def validate_types(self) -> Self:
+            if self.type not in schemas.RELATION_SIGNATURES:
+                raise ValueError(f"Unknown relation type: {self.type}")
+            if self.subject_type not in schemas.ENTITY_TYPES or self.object_type not in schemas.ENTITY_TYPES:
+                raise ValueError("Unknown relation endpoint type")
 
             return self
 
@@ -133,47 +130,74 @@ FAILED: Model -> Component — в отчёте зафиксирован отка
 }
 
 Канонический словарь названий:
-""".strip() + "\n" + json.dumps(vocabulary(), ensure_ascii=False, indent=2)
+""".strip()
 
 
-def extract_chunk(
-    chunk: schemas.Chunk,
-    llm: LLMClient,
+def _ground_entity(
+    entity_type: str, raw_name: str, codes: set[str], names: dict[str, list[str]]
+) -> schemas.Entity | None:
+    """Возвращает сущность из словаря или с подтверждённым кодом"""
+    name = canonical_name(entity_type, raw_name, names)
+    if name is None or (entity_type in CODE_TYPES and name not in codes):
+        return None
+    return schemas.Entity(entity_type, name)
+
+
+def _ground_response(
+    response: ExtractionResponse, chunk: schemas.Chunk, names: dict[str, list[str]]
 ) -> schemas.ExtractionResult:
-    """Возвращает сущности и связи чанка строго по схеме графа.
+    """Проверяет факты из ответа и считает отброшенные элементы"""
+    result = schemas.ExtractionResult(chunk.chunk_id, chunk.doc_id)
+    codes = set(find_codes(chunk.text))
+    entities: list[schemas.Entity] = []
+    relations: list[schemas.Relation] = []
 
-    Модель вызывается через `llm.chat(..., json_schema=EXTRACTION_SCHEMA)`. Запрос описывает схему
-    с направлением каждой связи и содержит хотя бы один пример. Всё, что не подтверждается текстом,
-    отбрасывается и считается в `dropped`: код, которого нет в чанке, название не из словаря,
-    связь с отброшенным концом. Пригодятся `find_codes` и `canonical_name` из `assistant.infra.grounding`.
-    Функция не падает ни на каком ответе модели: одна повторная попытка, затем пустой результат.
-    """
-    # TODO: запрос к модели, разбор JSON, проверки по тексту чанка и словарю
+    for item in response.entities:
+        entity = _ground_entity(item.type, item.name, codes, names)
+        if entity is None:
+            result.dropped += 1
+        else:
+            entities.append(entity)
 
-    resp = llm.chat(
-        messages=[
-            ChatMessage(role="system", content=_SYSTEM_PROMPT),
-            ChatMessage(role="user", content=chunk.text),
-        ],
-        json_schema=schemas.EXTRACTION_SCHEMA,
-    )
-    resp_obj = ExtractionResponse.model_validate_json(resp.content)
-    return schemas.ExtractionResult(
-        chunk_id=chunk.chunk_id,
-        doc_id=chunk.doc_id,
-        entities=[schemas.Entity(type=e.type, name=e.name) for e in resp_obj.entities],
-        relations=[
-            schemas.Relation(
-                subject=schemas.Entity(
-                    type=r.subject_type,
-                    name=r.subject,
-                ),
-                type=r.type,
-                object=schemas.Entity(
-                    type=r.object_type,
-                    name=r.object,
-                ),
-            )
-            for r in resp_obj.relations
-        ],
-    )
+    for item in response.relations:
+        subject = _ground_entity(item.subject_type, item.subject, codes, names)
+        target = _ground_entity(item.object_type, item.object, codes, names)
+        if subject is None or target is None:
+            result.dropped += 1
+            continue
+        relation = schemas.Relation(subject, item.type, target)
+        if not relation.matches_schema():
+            result.dropped += 1
+            continue
+        # Модель может указать подтвержденную сущность только в конце связи.
+        entities.extend((subject, target))
+        relations.append(relation)
+
+    result.entities = list(dict.fromkeys(entities))
+    result.relations = list(dict.fromkeys(relations))
+    return result
+
+
+def extract_chunk(chunk: schemas.Chunk, llm: LLMClient) -> schemas.ExtractionResult:
+    """Извлекает проверенные факты, повторяя запрос при некорректном JSON."""
+    names = vocabulary()
+    prompt = _SYSTEM_PROMPT + "\n" + json.dumps(names, ensure_ascii=False, indent=2)
+    messages = [
+        ChatMessage(role="system", content=prompt),
+        ChatMessage(role="user", content=chunk.text),
+    ]
+    for attempt in range(2):
+        response = llm.chat(messages, json_schema=schemas.EXTRACTION_SCHEMA, max_tokens=4096)
+        try:
+            data = ExtractionResponse.model_validate_json(response.content)
+        except ValidationError:
+            if attempt == 0:
+                messages.extend(
+                    [
+                        ChatMessage(role="assistant", content=response.content),
+                        ChatMessage(role="user", content="Исправь ответ по JSON-схеме и верни только JSON."),
+                    ]
+                )
+            continue
+        return _ground_response(data, chunk, names)
+    return schemas.ExtractionResult(chunk.chunk_id, chunk.doc_id)
