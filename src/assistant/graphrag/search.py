@@ -5,6 +5,7 @@ from itertools import combinations
 import networkx as nx
 from pydantic import BaseModel, Field, ValidationError
 
+from assistant.infra.evaluation import fabricated_facts
 from assistant.infra.grounding import code_type, find_codes, find_names
 from assistant.infra.llm import LLMClient
 from assistant.infra.schemas import MAP_SCHEMA, Answer, Community, Entity, KnowledgeBase
@@ -134,10 +135,18 @@ def _global_communities(question: str, kb: KnowledgeBase) -> list[Community]:
     return [community for community in kb.communities if relevant_nodes.intersection(community.nodes)]
 
 
+def _community_codes(kb: KnowledgeBase, community: Community) -> set[str]:
+    """Возвращает коды узлов и исходящих связей, использованных для сводки."""
+    nodes = set(community.nodes)
+    nodes.update(end for _, end in kb.graph.out_edges(community.nodes))
+    return {code for node in nodes for code in find_codes(kb.graph.nodes[node]["name"])}
+
+
 def global_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
     """Отвечает на обзорный вопрос по сводкам сообществ в два шага"""
     partials: list[str] = []
     sources: set[str] = set()
+    known_codes: set[str] = set()
     communities = _global_communities(question, kb)
     for community in communities:
         response = llm.chat(
@@ -161,6 +170,7 @@ def global_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
         if partial.score == 0 or not partial.answer.strip():
             continue
         partials.append(partial.answer.strip())
+        known_codes.update(_community_codes(kb, community))
         for node in community.nodes:
             sources.update(chunk.split("#", 1)[0] for chunk in kb.graph.nodes[node]["sources"])
 
@@ -186,5 +196,7 @@ def global_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
     )
     text = response.content.strip()
     if not text or _NO_FACTS.rstrip(".").casefold() in text.casefold():
+        return Answer(_NO_FACTS, refused=True)
+    if fabricated_facts(text, question, known_codes, tool_text=""):
         return Answer(_NO_FACTS, refused=True)
     return Answer(text, sources=sorted(sources))
