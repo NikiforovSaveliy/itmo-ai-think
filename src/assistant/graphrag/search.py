@@ -45,7 +45,7 @@ def _local_edges(graph: nx.DiGraph, anchors: list[str]) -> set[tuple[str, str]]:
 
 
 def _add_replacements(graph: nx.DiGraph, edges: set[tuple[str, str]]) -> None:
-    """Дополняет найденные факты цепочками замен по направлению ребер"""
+    """Дополняет найденные факты цепочками замен и поставщиками новых деталей"""
     pending = [node for node in {node for edge in edges for node in edge} if graph.nodes[node]["type"] == "Part"]
     visited: set[str] = set()
     while pending:
@@ -57,6 +57,11 @@ def _add_replacements(graph: nx.DiGraph, edges: set[tuple[str, str]]) -> None:
             if attrs["type"] == "REPLACED_BY":
                 edges.add((part, replacement))
                 pending.append(replacement)
+                edges.update(
+                    (replacement, supplier)
+                    for _, supplier, link in graph.out_edges(replacement, data=True)
+                    if link["type"] == "SUPPLIED_BY"
+                )
 
 
 def _local_facts(graph: nx.DiGraph, edges: set[tuple[str, str]]) -> tuple[list[str], list[str]]:
