@@ -1,5 +1,6 @@
 """Два режима поиска по графу. Требования FR-4, FR-5 и FR-10."""
 
+from collections import Counter
 from itertools import combinations
 
 import networkx as nx
@@ -65,12 +66,17 @@ def _add_replacements(graph: nx.DiGraph, edges: set[tuple[str, str]]) -> None:
                 )
 
 
-def _local_facts(graph: nx.DiGraph, edges: set[tuple[str, str]]) -> tuple[list[str], list[str]]:
+def _local_facts(
+    graph: nx.DiGraph, edges: set[tuple[str, str]], anchor: str | None = None
+) -> tuple[list[str], list[str]]:
     """Формирует список фактов в пределах лимита и собирает их документы"""
     facts: list[str] = []
     sources: set[str] = set()
     chars = 0
-    for start, end in sorted(edges, key=lambda edge: (graph.edges[edge]["type"] != "REPLACED_BY", edge)):
+    for start, end in sorted(
+        edges,
+        key=lambda edge: (anchor is not None and anchor not in edge, graph.edges[edge]["type"] != "REPLACED_BY", edge),
+    ):
         attrs = graph.edges[start, end]
         fact = f"{graph.nodes[start]['name']} -{attrs['type']}-> {graph.nodes[end]['name']}"
         line_chars = len(f"{len(facts) + 1}. {fact}") + bool(facts)
@@ -98,14 +104,23 @@ def local_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
     if len(anchors) > 1:
         _add_replacements(graph, edges)
 
-    facts, sources = _local_facts(graph, edges)
+    anchor = anchors[0] if len(anchors) == 1 else None
+    facts, sources = _local_facts(graph, edges, anchor)
     if not facts:
         return Answer(_NO_FACTS, refused=True)
+
+    prompt = _LOCAL_PROMPT
+    if anchor is not None and graph.nodes[anchor]["type"] == "Part":
+        prompt += (
+            " HAS_PART связывает модель с деталью, установленной по руководству. "
+            "Исходная деталь связи REPLACED_BY снята с производства и заменена конечной деталью. "
+            "Если спрашивают, где деталь была установлена, перечисли модели из HAS_PART с этой деталью."
+        )
 
     numbered_facts = "\n".join(f"{number}. {fact}" for number, fact in enumerate(facts, start=1))
     response = llm.chat(
         [
-            {"role": "system", "content": _LOCAL_PROMPT},
+            {"role": "system", "content": prompt},
             {"role": "user", "content": f"Вопрос: {question}\n\nФакты:\n{numbered_facts}"},
         ]
     )
@@ -115,24 +130,68 @@ def local_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
     return Answer(text, sources=sources, facts=facts)
 
 
-def _global_communities(question: str, kb: KnowledgeBase) -> list[Community]:
-    """Выбирает сообщества названных линеек и связанных с ними моделей."""
-    lines = {
+def _product_lines(question: str, kb: KnowledgeBase) -> set[str]:
+    """Находит идентификаторы названных линеек."""
+    return {
         Entity(kind, name).node_id
         for kind, name in find_names(question, {"ProductLine": kb.vocabulary.get("ProductLine", [])})
     }
+
+
+def _line_models(graph: nx.DiGraph, lines: set[str]) -> set[str]:
+    """Находит модели, связанные с линейками рёбрами BELONGS_TO."""
+    return {
+        model
+        for line in lines
+        if line in graph
+        for model, _, attrs in graph.in_edges(line, data=True)
+        if attrs["type"] == "BELONGS_TO"
+    }
+
+
+def _global_communities(question: str, kb: KnowledgeBase) -> list[Community]:
+    """Выбирает сообщества названных линеек и связанных с ними моделей."""
+    lines = _product_lines(question, kb)
     if not lines:
         return kb.communities
 
-    models = {
-        model
-        for line in lines
-        if line in kb.graph
-        for model, _, attrs in kb.graph.in_edges(line, data=True)
-        if attrs["type"] == "BELONGS_TO"
-    }
-    relevant_nodes = lines | models
+    relevant_nodes = lines | _line_models(kb.graph, lines)
     return [community for community in kb.communities if relevant_nodes.intersection(community.nodes)]
+
+
+def _line_facts(graph: nx.DiGraph, models: set[str]) -> tuple[list[str], set[str], set[str]]:
+    """Собирает итоги отказов и связи замен по моделям выбранных линеек."""
+    model_failures: Counter[str] = Counter()
+    component_failures: Counter[str] = Counter()
+    replacements: set[tuple[str, str, str]] = set()
+    sources: set[str] = set()
+    codes: set[str] = set()
+    for model in sorted(models):
+        model_name = graph.nodes[model]["name"]
+        codes.add(model_name)
+        model_failures[model_name] = 0
+        for _, target, attrs in graph.out_edges(model, data=True):
+            if attrs["type"] == "FAILED":
+                model_failures[model_name] += attrs["weight"]
+                component_failures[graph.nodes[target]["name"]] += attrs["weight"]
+                sources.update(chunk.split("#", 1)[0] for chunk in attrs["sources"])
+            elif attrs["type"] == "HAS_PART":
+                for _, replacement, link in graph.out_edges(target, data=True):
+                    if link["type"] != "REPLACED_BY":
+                        continue
+                    old_part = graph.nodes[target]["name"]
+                    new_part = graph.nodes[replacement]["name"]
+                    replacements.add((model_name, old_part, new_part))
+                    codes.update((old_part, new_part))
+                    sources.update(chunk.split("#", 1)[0] for chunk in attrs["sources"] + link["sources"])
+
+    facts = [f"Отказы модели {model}: {count}" for model, count in model_failures.items()]
+    facts.extend(f"Отказы узла «{component}»: {count}" for component, count in component_failures.most_common())
+    facts.extend(
+        f"Модель {model}: исходная деталь {old_part}, замена {new_part}."
+        for model, old_part, new_part in sorted(replacements)
+    )
+    return facts, sources, codes
 
 
 def _community_codes(kb: KnowledgeBase, community: Community) -> set[str]:
@@ -174,23 +233,32 @@ def global_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
         for node in community.nodes:
             sources.update(chunk.split("#", 1)[0] for chunk in kb.graph.nodes[node]["sources"])
 
-    if not partials:
+    models = _line_models(kb.graph, _product_lines(question, kb))
+    facts, graph_sources, graph_codes = _line_facts(kb.graph, models)
+    if not partials and not facts:
         return Answer(_NO_FACTS, refused=True)
 
     answers = "\n".join(f"{index}. {answer}" for index, answer in enumerate(partials, start=1))
     if len(communities) == 1:
         answers += f"\n\nСводка, подтверждающая частичный ответ:\n{communities[0].summary}"
+    system_prompt = (
+        "Объедини частичные ответы в один ответ по-русски. "
+        "Опирайся на частичные ответы и приложенную сводку, если она есть. "
+        "Не учитывай один факт дважды. "
+        f"Если данных недостаточно, ответь: «{_NO_FACTS}»"
+    )
+    if facts:
+        answers += "\n\nПроверенные данные графа по выбранной линейке:\n" + "\n".join(facts)
+        system_prompt += (
+            " Для статистики отказов и замен используй прежде всего проверенные данные графа. "
+            "Различай итоги по моделям и по узлам, исходные детали и их замены. "
+            "Отвечай ровно на заданный вопрос, без посторонних кодов."
+        )
+        known_codes.update(graph_codes)
+        sources.update(graph_sources)
     response = llm.chat(
         [
-            {
-                "role": "system",
-                "content": (
-                    "Объедини частичные ответы в один ответ по-русски. "
-                    "Опирайся на частичные ответы и приложенную сводку, если она есть. "
-                    "Не учитывай один факт дважды. "
-                    f"Если данных недостаточно, ответь: «{_NO_FACTS}»"
-                ),
-            },
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": f"Вопрос: {question}\n\nЧастичные ответы:\n{answers}"},
         ]
     )
