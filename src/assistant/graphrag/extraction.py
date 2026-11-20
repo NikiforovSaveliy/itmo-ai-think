@@ -1,54 +1,13 @@
 """Извлечение сущностей и связей из чанка. Требование FR-1."""
 
 import json
-import re
-from typing import Self
 
-from pydantic import BaseModel, ConfigDict, ValidationError, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, ValidationError, ValidationInfo, field_validator
 
 from assistant.infra import schemas
 from assistant.infra.config import vocabulary
-from assistant.infra.grounding import CODE_TYPES, canonical_name, code_type, find_codes
+from assistant.infra.grounding import CODE_TYPES, canonical_name, find_codes
 from assistant.infra.llm import ChatMessage, LLMClient
-
-
-class ExtractionResponse(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-
-    class Entity(BaseModel):
-        model_config = ConfigDict(extra="forbid", strict=True)
-
-        type: str
-        name: str
-
-        @field_validator("type")
-        @classmethod
-        def validate_type(cls, value: str) -> str:
-            if value not in schemas.ENTITY_TYPES:
-                raise ValueError(f"Unknown entity type: {value}")
-            return value
-
-    class Relation(BaseModel):
-        model_config = ConfigDict(extra="forbid", strict=True)
-
-        subject_type: str
-        subject: str
-        type: str
-        object_type: str
-        object: str
-
-        @model_validator(mode="after")
-        def validate_types(self) -> Self:
-            if self.type not in schemas.RELATION_SIGNATURES:
-                raise ValueError(f"Unknown relation type: {self.type}")
-            if self.subject_type not in schemas.ENTITY_TYPES or self.object_type not in schemas.ENTITY_TYPES:
-                raise ValueError("Unknown relation endpoint type")
-
-            return self
-
-    entities: list[Entity]
-    relations: list[Relation]
-
 
 _SYSTEM_PROMPT = """
 Ты извлекаешь факты из документов сервисной службы «ПолярТех».
@@ -133,116 +92,145 @@ FAILED: Model -> Component — в отчёте зафиксирован отка
 Канонический словарь названий:
 """.strip()
 
-
-def _ground_entity(
-    entity_type: str, raw_name: str, codes: set[str], names: dict[str, list[str]]
-) -> schemas.Entity | None:
-    """Возвращает сущность из словаря или с подтверждённым кодом"""
-    name = canonical_name(entity_type, raw_name, names)
-    if name is None or (entity_type in CODE_TYPES and name not in codes):
-        return None
-    return schemas.Entity(entity_type, name)
+_CORRECTION_PROMPT = "Исправь ответ по JSON-схеме и верни только JSON."
+_MAX_ATTEMPTS = 2
+_MAX_TOKENS = 4096
 
 
-def _installed_parts(text: str) -> list[schemas.Relation]:
-    """Извлекает связи HAS_PART из явного списка установленных узлов"""
-    _, heading, section = text.partition("\n## Состав узлов\n")
-    if not heading:
-        return []
+class ExtractionResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
 
-    introduction, *rows = section.split("\n## ", 1)[0].strip().splitlines() or [""]
-    if not introduction.startswith("В ") or not introduction.endswith(" установлены следующие узлы."):
-        return []
-    model_codes = find_codes(introduction)
-    if len(model_codes) != 1 or code_type(model_codes[0]) != "Model":
-        return []
+    class Entity(BaseModel):
+        model_config = ConfigDict(extra="forbid", strict=True)
 
-    model = schemas.Entity("Model", model_codes[0])
-    relations = []
-    for row in rows:
-        if not row.startswith("- "):
-            continue
-        part_codes = find_codes(row)
-        if len(part_codes) == 1 and code_type(part_codes[0]) == "Part":
-            relations.append(schemas.Relation(model, "HAS_PART", schemas.Entity("Part", part_codes[0])))
-    return relations
+        type: str
+        name: str
+
+        @field_validator("type")
+        @classmethod
+        def validate_type(cls, value: str) -> str:
+            return _validate_entity_type(value)
+
+    class Relation(BaseModel):
+        model_config = ConfigDict(extra="forbid", strict=True)
+
+        subject_type: str
+        subject: str
+        type: str
+        object_type: str
+        object: str
+
+        @field_validator("subject_type", "object_type")
+        @classmethod
+        def validate_endpoint_type(cls, value: str) -> str:
+            return _validate_entity_type(value)
+
+        @field_validator("type")
+        @classmethod
+        def validate_relation_type(cls, value: str) -> str:
+            if value not in schemas.RELATION_SIGNATURES:
+                raise ValueError(f"Unknown relation type: {value}")
+            return value
+
+        @field_validator("object_type")
+        @classmethod
+        def validate_signature(cls, value: str, info: ValidationInfo) -> str:
+            # Pydantic includes only previously validated fields in info.data.
+            relation_type = info.data.get("type")
+            subject_type = info.data.get("subject_type")
+            if relation_type is None or subject_type is None:
+                return value
+            expected_subject, expected_object = schemas.RELATION_SIGNATURES[relation_type]
+            if (subject_type, value) != (expected_subject, expected_object):
+                raise ValueError(f"{relation_type} requires {expected_subject} -> {expected_object}")
+            return value
+
+    entities: list[Entity]
+    relations: list[Relation]
 
 
-def _line_memberships(text: str, names: dict[str, list[str]]) -> list[schemas.Relation]:
-    """Извлекает принадлежность модели к линейке из прямого утверждения."""
-    lines = {name.casefold(): name for name in names.get("ProductLine", [])}
-    relations = []
-    for raw_model, raw_line in re.findall(
-        r"\b([A-Z]{2}[- ]?\d{3})\s+входит в линейку «([^»]+)»", text, flags=re.IGNORECASE
-    ):
-        codes = find_codes(raw_model)
-        line = lines.get(raw_line.casefold())
-        if len(codes) == 1 and code_type(codes[0]) == "Model" and line is not None:
-            relations.append(
-                schemas.Relation(schemas.Entity("Model", codes[0]), "BELONGS_TO", schemas.Entity("ProductLine", line))
-            )
-    return relations
-
-
-def _ground_response(
-    response: ExtractionResponse, chunk: schemas.Chunk, names: dict[str, list[str]]
-) -> schemas.ExtractionResult:
-    """Проверяет факты из ответа и считает отброшенные элементы"""
-    result = schemas.ExtractionResult(chunk.chunk_id, chunk.doc_id)
-    codes = set(find_codes(chunk.text))
-    entities: list[schemas.Entity] = []
-    relations: list[schemas.Relation] = []
-
-    for item in response.entities:
-        entity = _ground_entity(item.type, item.name, codes, names)
-        if entity is None:
-            result.dropped += 1
-        else:
-            entities.append(entity)
-
-    for item in response.relations:
-        subject = _ground_entity(item.subject_type, item.subject, codes, names)
-        target = _ground_entity(item.object_type, item.object, codes, names)
-        if subject is None or target is None:
-            result.dropped += 1
-            continue
-        relation = schemas.Relation(subject, item.type, target)
-        if not relation.matches_schema():
-            result.dropped += 1
-            continue
-        # Модель может указать подтвержденную сущность только в конце связи.
-        entities.extend((subject, target))
-        relations.append(relation)
-
-    for relation in _installed_parts(chunk.text) + _line_memberships(chunk.text, names):
-        entities.extend((relation.subject, relation.object))
-        relations.append(relation)
-
-    result.entities = list(dict.fromkeys(entities))
-    result.relations = list(dict.fromkeys(relations))
-    return result
+def _validate_entity_type(value: str) -> str:
+    if value not in schemas.ENTITY_TYPES:
+        raise ValueError(f"Unknown entity type: {value}")
+    return value
 
 
 def extract_chunk(chunk: schemas.Chunk, llm: LLMClient) -> schemas.ExtractionResult:
     """Извлекает проверенные факты, повторяя запрос при некорректном JSON."""
     names = vocabulary()
     prompt = _SYSTEM_PROMPT + "\n" + json.dumps(names, ensure_ascii=False, indent=2)
-    messages = [
-        ChatMessage(role="system", content=prompt),
-        ChatMessage(role="user", content=chunk.text),
+    try:
+        response = _call_llm(llm, prompt, chunk.text)
+        return _build_filtered_extraction(response, chunk, names)
+    except ValueError:
+        return schemas.ExtractionResult(chunk.chunk_id, chunk.doc_id)
+
+
+def _call_llm(client: LLMClient, system_message: str, user_message: str) -> ExtractionResponse:
+    messages: list[ChatMessage] = [
+        ChatMessage(role="system", content=system_message),
+        ChatMessage(role="user", content=user_message),
     ]
-    for attempt in range(2):
-        response = llm.chat(messages, json_schema=schemas.EXTRACTION_SCHEMA, max_tokens=4096)
+
+    attempt = 1
+    while True:
+        response = client.chat(
+            messages,
+            json_schema=schemas.EXTRACTION_SCHEMA,
+            max_tokens=_MAX_TOKENS,
+        )
         try:
-            data = ExtractionResponse.model_validate_json(response.content)
-        except ValidationError:
-            if attempt == 0:
-                messages.extend(
-                    [
-                        ChatMessage(role="assistant", content=response.content),
-                        ChatMessage(role="user", content="Исправь ответ по JSON-схеме и верни только JSON."),
-                    ]
-                )
-            continue
-        return _ground_response(data, chunk, names)
-    return schemas.ExtractionResult(chunk.chunk_id, chunk.doc_id)
+            return ExtractionResponse.model_validate_json(response.content)
+        except ValidationError as error:
+            if attempt == _MAX_ATTEMPTS:
+                raise ValueError(f"LLM response failed schema validation after {attempt} attempts") from error
+            messages = [
+                *messages,
+                ChatMessage(role="assistant", content=response.content),
+                ChatMessage(role="user", content=f"{_CORRECTION_PROMPT}\n\nОшибки валидации :\n{error}"),
+            ]
+            attempt += 1
+
+
+def _build_filtered_extraction(
+    response: ExtractionResponse, chunk: schemas.Chunk, names: dict[str, list[str]]
+) -> schemas.ExtractionResult:
+    """Фильтрует факты из ответа модели и подсчитывает отброшенные элементы."""
+    codes = set(find_codes(chunk.text))
+    entity_candidates = (_normalize_entity_or_discard(item.type, item.name, codes, names) for item in response.entities)
+    relation_candidates = (_normalize_relation_or_discard(item, codes, names) for item in response.relations)
+    entities = [entity for entity in entity_candidates if entity is not None]
+    relations = [relation for relation in relation_candidates if relation is not None]
+    dropped = (len(response.entities) - len(entities)) + (len(response.relations) - len(relations))
+
+    # Модель может указать подтверждённую сущность только в связи.
+    for relation in relations:
+        entities.extend((relation.subject, relation.object))
+
+    return schemas.ExtractionResult(
+        chunk.chunk_id,
+        chunk.doc_id,
+        entities=list(dict.fromkeys(entities)),
+        relations=list(dict.fromkeys(relations)),
+        dropped=dropped,
+    )
+
+
+def _normalize_entity_or_discard(
+    entity_type: str, raw_name: str, codes: set[str], names: dict[str, list[str]]
+) -> schemas.Entity | None:
+    """Возвращает каноническую сущность или None, если проверка не пройдена."""
+    name = canonical_name(entity_type, raw_name, names)
+    if name is None or (entity_type in CODE_TYPES and name not in codes):
+        return None
+    return schemas.Entity(entity_type, name)
+
+
+def _normalize_relation_or_discard(
+    item: ExtractionResponse.Relation, codes: set[str], names: dict[str, list[str]]
+) -> schemas.Relation | None:
+    subject = _normalize_entity_or_discard(item.subject_type, item.subject, codes, names)
+    target = _normalize_entity_or_discard(item.object_type, item.object, codes, names)
+    if subject is None or target is None:
+        return None
+    return schemas.Relation(subject, item.type, target)
