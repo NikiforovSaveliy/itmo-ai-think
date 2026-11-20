@@ -10,17 +10,18 @@ from assistant.infra.schemas import Community
 
 def detect_communities(graph: nx.DiGraph) -> list[Community]:
     """Разбивает взвешенный граф на сообщества алгоритмом Лувена."""
-    undirected = nx.Graph()
+    undirected = nx.MultiGraph()
     undirected.add_nodes_from(sorted(graph.nodes))
-    for start, end, attrs in sorted(graph.edges(data=True)):
-        previous = undirected.get_edge_data(start, end, default={})
-        undirected.add_edge(start, end, weight=previous.get("weight", 0) + attrs.get("weight", 1))
+    undirected.add_weighted_edges_from(sorted(graph.edges(data="weight", default=1)))
 
     if not undirected.size(weight="weight"):
         return [Community(index, [node]) for index, node in enumerate(undirected)]
 
     groups = nx.community.louvain_communities(undirected, weight="weight", seed=SEED)
-    return [Community(index, nodes) for index, nodes in enumerate(sorted(map(sorted, groups)))]
+    return [
+        Community(index, nodes)
+        for index, nodes in enumerate(sorted(map(sorted, groups)))
+    ]
 
 
 def summarize_community(community: Community, graph: nx.DiGraph, llm: LLMClient) -> str:
@@ -39,8 +40,12 @@ def summarize_community(community: Community, graph: nx.DiGraph, llm: LLMClient)
         if relation == "FAILED":
             failures[target] += weight
 
-    totals = ", ".join(f"{relation}: {count}" for relation, count in sorted(counts.items()))
-    failure_totals = ", ".join(f"{component}: {count}" for component, count in failures.most_common())
+    totals = ", ".join(
+        f"{relation}: {count}" for relation, count in sorted(counts.items())
+    )
+    failure_totals = ", ".join(
+        f"{component}: {count}" for component, count in failures.most_common()
+    )
     fact_text = "\n".join(facts)
     response = llm.chat(
         [
