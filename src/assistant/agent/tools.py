@@ -1,110 +1,234 @@
 """Инструменты поиска и ERP для агента."""
 
-from collections.abc import Callable
+from collections.abc import Callable, Container, Mapping
+from dataclasses import dataclass, replace
+from functools import partial
+from typing import Annotated, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from assistant.graphrag.search import global_search, local_search
-from assistant.infra.erp_client import ErpClient, ErpNotFound, ErpRejected
-from assistant.infra.grounding import code_type, normalize_code
+from assistant.infra.erp_client import ErpClient, ErpNotFound, ErpRejected, ErpUnavailable
 from assistant.infra.llm import LLMClient
 from assistant.infra.schemas import KnowledgeBase
 
-_WAREHOUSES = ("Москва", "Санкт-Петербург", "Казань", "Новосибирск")
-_QUESTION = {"type": "string", "description": "Вопрос для поиска по базе знаний"}
-_PART_ID = {"type": "string", "pattern": "^P-[0-9]{4}[A-Z]?$", "description": "Подтверждённый номер детали"}
-_WAREHOUSE = {"type": "string", "enum": list(_WAREHOUSES)}
-_QUANTITY = {"type": "integer", "minimum": 1, "description": "Количество, указанное пользователем"}
-_MODEL = {"type": "string", "pattern": "^(AR|BZ|GS)-[0-9]{3}$"}
+
+class Arguments(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid")
 
 
-def _schema(name: str, description: str, **properties: dict) -> dict:
-    return {
-        "type": "function",
-        "function": {
-            "name": name,
-            "description": description,
-            "parameters": {
-                "type": "object",
-                "properties": properties,
-                "required": list(properties),
-                "additionalProperties": False,
+@dataclass(frozen=True)
+class Tool:
+    function: Callable[..., dict]
+    input_schema: type[Arguments]
+    response_schema: type[BaseModel]
+    description: str
+
+    def prepare(self, arguments: dict) -> Callable[[], dict] | dict:
+        """Проверяет аргументы до подтверждения заказа или обращения к ERP."""
+        try:
+            validated = self.input_schema.model_validate(arguments)
+        except ValidationError as exc:
+            return {"error": f"Неверные параметры инструмента: {exc}"}
+        return partial(self._execute, validated)
+
+    def __call__(self, **arguments) -> dict:
+        prepared = self.prepare(arguments)
+        return prepared() if callable(prepared) else prepared
+
+    def _execute(self, arguments: Arguments) -> dict:
+        params = arguments.model_dump()
+        for _ in range(3):
+            try:
+                result = self.function(**params)
+                if isinstance(result, dict) and "error" in result:
+                    return result
+                self.response_schema.model_validate(result, strict=True)
+                return result
+            except ErpUnavailable:
+                continue
+            except ErpNotFound as exc:
+                return {"error": f"Данных в ERP нет: {exc}"}
+            except ErpRejected as exc:
+                return {"error": f"ERP отклонила запрос: {exc}"}
+            except ValidationError as exc:
+                return {"error": f"Некорректный ответ инструмента: {exc}"}
+            except Exception as exc:
+                return {"error": f"Ошибка выполнения инструмента: {exc}"}
+        return {"error": "Данные ERP получить не удалось.", "unavailable": True}
+
+
+_REGISTRY: dict[str, Tool] = {}
+
+
+def register_tool(input_schema: type[Arguments], response_schema: type[BaseModel]):
+    """Регистрирует функцию, принимающую контекст первым аргументом, под её именем."""
+
+    def decorate(function: Callable[..., dict]) -> Callable[..., dict]:
+        _REGISTRY[function.__name__] = Tool(function, input_schema, response_schema, function.__doc__ or "")
+        return function
+
+    return decorate
+
+
+@dataclass(frozen=True)
+class _Context:
+    kb: KnowledgeBase
+    llm: LLMClient
+    erp: ErpClient
+
+
+def get_tool_schemas(names: Container[str] | None = None) -> list[dict]:
+    """Возвращает JSON-схемы зарегистрированных инструментов для LLM."""
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": tool.description,
+                "parameters": tool.input_schema.model_json_schema(),
             },
-        },
-    }
-
-
-TOOL_SCHEMAS = [
-    _schema("search_knowledge", "Найти конкретную деталь, замену, узел или регламент.", question=_QUESTION),
-    _schema("summarize_topic", "Ответить на обзорный вопрос по сообществам графа.", question=_QUESTION),
-    _schema("check_stock", "Проверить остаток детали на конкретном складе.", part_id=_PART_ID, warehouse=_WAREHOUSE),
-    _schema("get_price", "Узнать цену детали в рублях.", part_id=_PART_ID),
-    _schema(
-        "create_service_order",
-        "Подготовить сервисный заказ по явному запросу пользователя.",
-        part_id=_PART_ID,
-        warehouse=_WAREHOUSE,
-        qty=_QUANTITY,
-        model=_MODEL,
-    ),
-]
-_PARAMETERS = {item["function"]["name"]: item["function"]["parameters"]["properties"] for item in TOOL_SCHEMAS}
-
-
-def _is_code(value: str, kind: str) -> bool:
-    return normalize_code(value) == value and code_type(value) == kind
+        }
+        for name, tool in _REGISTRY.items()
+        if names is None or name in names
+    ]
 
 
 def validate_arguments(name: str, arguments: dict) -> str | None:
-    """Проверяет набор и значения аргументов до выполнения инструмента."""
-    parameters = _PARAMETERS.get(name)
-    if parameters is None:
+    """Возвращает причину отказа, если инструмент или аргументы неизвестны."""
+    if name not in _REGISTRY:
         return f"Неизвестный инструмент: {name}."
-    if arguments.keys() != parameters.keys():
-        return f"Ожидаются параметры: {', '.join(parameters)}."
-    for key, value in arguments.items():
-        if key == "qty":
-            if type(value) is not int or value <= 0:
-                return "Количество должно быть положительным целым числом."
-        elif not isinstance(value, str) or not value.strip():
-            return f"Параметр {key} должен быть непустой строкой."
-        elif key == "warehouse" and value not in _WAREHOUSES:
-            return f"Неизвестный склад: {value}."
-        elif key == "part_id" and not _is_code(value, "Part"):
-            return "Укажите номер детали вида P-1042 или P-1042B."
-        elif key == "model" and not _is_code(value, "Model"):
-            return "Укажите код модели вида AR-210."
-    return None
+    prepared = _REGISTRY[name].prepare(arguments)
+    return prepared["error"] if isinstance(prepared, dict) else None
 
 
-def _validated(name: str, function: Callable[..., dict]) -> Callable[..., dict]:
-    def execute(**arguments) -> dict:
-        if error := validate_arguments(name, arguments):
-            return {"error": error}
-        try:
-            return function(**arguments)
-        except ErpNotFound as exc:
-            return {"error": f"Данных в ERP нет: {exc}"}
-        except ErpRejected as exc:
-            return {"error": f"ERP отклонила запрос: {exc}"}
-
-    return execute
-
-
-def build_tools(kb: KnowledgeBase, llm: LLMClient, erp: ErpClient) -> dict[str, Callable[..., dict]]:
+def build_tools(kb: KnowledgeBase, llm: LLMClient, erp: ErpClient) -> dict[str, Tool]:
     """Связывает инструменты агента с поиском и клиентом ERP."""
+    context = _Context(kb, llm, erp)
+    return {name: replace(tool, function=partial(tool.function, context)) for name, tool in _REGISTRY.items()}
 
-    def search_knowledge(question: str) -> dict:
-        answer = local_search(question, kb, llm)
-        return {"answer": answer.text, "facts": answer.facts, "sources": answer.sources, "refused": answer.refused}
 
-    def summarize_topic(question: str) -> dict:
-        answer = global_search(question, kb, llm)
-        return {"answer": answer.text, "sources": answer.sources, "refused": answer.refused}
+def prepare_call(
+    tools: Mapping[str, Callable[..., dict]], name: str, arguments: dict, known_codes: set[str]
+) -> Callable[[], dict] | dict:
+    """Готовит проверенный вызов либо возвращает сообщение об ошибке для модели."""
+    if name not in _REGISTRY or name not in tools:
+        return {"error": f"Неизвестный инструмент: {name}."}
+    tool = tools[name]
+    if not isinstance(tool, Tool):
+        tool = replace(_REGISTRY[name], function=tool)
+    prepared = tool.prepare(arguments)
+    if callable(prepared) and "part_id" in arguments and arguments["part_id"] not in known_codes:
+        return {"error": "Номер детали не подтверждён. Сначала вызови search_knowledge."}
+    return prepared
 
-    functions = {
-        "search_knowledge": search_knowledge,
-        "summarize_topic": summarize_topic,
-        "check_stock": erp.get_stock,
-        "get_price": erp.get_price,
-        "create_service_order": erp.create_order,
-    }
-    return {name: _validated(name, function) for name, function in functions.items()}
+
+Question = Annotated[str, Field(pattern=r"\S", description="Вопрос для поиска по базе знаний")]
+PartId = Annotated[str, Field(pattern=r"^P-[0-9]{4}[A-Z]?$", description="Подтверждённый номер детали")]
+Warehouse = Literal["Москва", "Санкт-Петербург", "Казань", "Новосибирск"]
+
+
+# search_knowledge
+
+
+class SearchArgs(Arguments):
+    question: Question
+
+
+class SearchResult(BaseModel):
+    answer: str
+    sources: list[str]
+    refused: bool
+    facts: list[str]
+
+
+@register_tool(SearchArgs, SearchResult)
+def search_knowledge(context: _Context, question: str) -> dict:
+    """Найти конкретную деталь, замену, узел или регламент."""
+    answer = local_search(question, context.kb, context.llm)
+    return {"answer": answer.text, "facts": answer.facts, "sources": answer.sources, "refused": answer.refused}
+
+
+# summarize_topic
+
+
+class SummaryArgs(Arguments):
+    question: Question
+
+
+class SummaryResult(BaseModel):
+    answer: str
+    sources: list[str]
+    refused: bool
+
+
+@register_tool(SummaryArgs, SummaryResult)
+def summarize_topic(context: _Context, question: str) -> dict:
+    """Ответить на обзорный вопрос по сообществам графа."""
+    answer = global_search(question, context.kb, context.llm)
+    return {"answer": answer.text, "sources": answer.sources, "refused": answer.refused}
+
+
+# check_stock
+
+
+class StockArgs(Arguments):
+    part_id: PartId
+    warehouse: Warehouse
+
+
+class StockResult(BaseModel):
+    part_id: str
+    warehouse: str
+    qty: int
+    discontinued: bool
+
+
+@register_tool(StockArgs, StockResult)
+def check_stock(context: _Context, part_id: str, warehouse: str) -> dict:
+    """Проверить остаток детали на конкретном складе."""
+    return context.erp.get_stock(part_id=part_id, warehouse=warehouse)
+
+
+# get_price
+
+
+class PartArgs(Arguments):
+    part_id: PartId
+
+
+class PriceResult(BaseModel):
+    part_id: str
+    name: str
+    price_rub: int
+    discontinued: bool
+
+
+@register_tool(PartArgs, PriceResult)
+def get_price(context: _Context, part_id: str) -> dict:
+    """Узнать цену детали в рублях."""
+    return context.erp.get_price(part_id=part_id)
+
+
+# create_service_order
+
+
+class OrderArgs(Arguments):
+    part_id: PartId
+    warehouse: Warehouse
+    qty: int = Field(gt=0, description="Количество, указанное пользователем")
+    model: str = Field(pattern=r"^(AR|BZ|GS)-[0-9]{3}$")
+
+
+class OrderResult(OrderArgs):
+    order_id: str
+    status: str
+
+
+@register_tool(OrderArgs, OrderResult)
+def create_service_order(context: _Context, part_id: str, warehouse: str, qty: int, model: str) -> dict:
+    """Подготовить сервисный заказ по явному запросу пользователя."""
+    return context.erp.create_order(part_id=part_id, warehouse=warehouse, qty=qty, model=model)
+
+
+TOOL_SCHEMAS = get_tool_schemas()

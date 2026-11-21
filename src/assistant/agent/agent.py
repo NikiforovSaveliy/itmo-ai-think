@@ -2,17 +2,15 @@
 
 import json
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 
-from assistant.agent.tools import TOOL_SCHEMAS, validate_arguments
-from assistant.infra.erp_client import ErpUnavailable
+from assistant.agent.tools import get_tool_schemas, prepare_call
 from assistant.infra.evaluation import has_fact
 from assistant.infra.grounding import find_codes
 from assistant.infra.llm import LLMClient, tool_message
 from assistant.infra.schemas import AgentResult, ToolStep
 
 _NO_FACTS = "В базе знаний не найдено."
-_ERP_UNAVAILABLE = "Данные ERP получить не удалось."
 _ORDER = "create_service_order"
 _WITH_UNIT = re.compile(r"(?<![\w-])(\d+(?:[ \u00a0\u202f]\d{3})*)\s*(руб\w*|₽|шт\w*|единиц\w*)", re.IGNORECASE)
 _SYSTEM_PROMPT = (
@@ -24,17 +22,6 @@ _SYSTEM_PROMPT = (
     "Вызывай create_service_order только по явной просьбе оформить заказ и с указанным количеством. "
     f"Если в базе нет ответа, скажи: «{_NO_FACTS}»"
 )
-
-
-def _call_tool(function: Callable[..., dict], args: dict) -> dict:
-    """Повторяет временно недоступный запрос ERP ещё два раза."""
-    for attempt in range(3):
-        try:
-            return function(**args)
-        except ErpUnavailable:
-            if attempt == 2:
-                return {"error": _ERP_UNAVAILABLE, "unavailable": True}
-    raise AssertionError("Недостижимый исход запроса ERP")
 
 
 def _unsupported(text: str, known_codes: set[str], results: list[dict]) -> list[str]:
@@ -66,7 +53,7 @@ def _partial_answer(results: list[dict]) -> str:
 def run_agent(
     question: str,
     llm: LLMClient,
-    tools: dict[str, Callable[..., dict]],
+    tools: Mapping[str, Callable[..., dict]],
     *,
     max_steps: int = 6,
     confirm: bool = False,
@@ -81,11 +68,12 @@ def run_agent(
     results: list[dict] = []
     cache: dict[tuple[str, str], dict] = {}
     known_codes = set(find_codes(question))
-    unavailable = False
+    unavailable_message = ""
+    schemas = get_tool_schemas(tools)
 
     def finish(text: str, *, refused: bool = False, pending: dict | None = None) -> AgentResult:
-        if unavailable and _ERP_UNAVAILABLE.casefold() not in text.casefold():
-            text = f"{text} {_ERP_UNAVAILABLE}"
+        if unavailable_message and unavailable_message.casefold() not in text.casefold():
+            text = f"{text} {unavailable_message}"
         return AgentResult(
             text,
             steps=steps,
@@ -96,7 +84,7 @@ def run_agent(
         )
 
     while len(steps) < max_steps:
-        response = llm.chat(messages, tools=TOOL_SCHEMAS)
+        response = llm.chat(messages, tools=schemas)
         messages.append(response.as_message())
         if not response.tool_calls:
             text = response.content.strip()
@@ -120,12 +108,8 @@ def run_agent(
             if len(steps) >= max_steps:
                 break
             args = call.arguments
-            error = validate_arguments(call.name, args)
-            if call.name not in tools:
-                error = f"Неизвестный инструмент: {call.name}."
-            if not error and "part_id" in args and args["part_id"] not in known_codes:
-                error = "Номер детали не подтверждён. Сначала вызови search_knowledge."
-            if not error and call.name == _ORDER:
+            prepared = prepare_call(tools, call.name, args, known_codes)
+            if callable(prepared) and call.name == _ORDER:
                 if not has_fact(question, [str(args["qty"])]):
                     steps.append(ToolStep(call.name, args, error="Количество не указано пользователем."))
                     return finish("Сколько штук нужно заказать?")
@@ -144,18 +128,18 @@ def run_agent(
                         pending={"tool": call.name, "args": args},
                     )
 
-            if error:
-                result = {"error": error}
+            if isinstance(prepared, dict):
+                result = prepared
             else:
                 key = (call.name, json.dumps(args, sort_keys=True, ensure_ascii=False))
                 if key not in cache:
-                    cache[key] = _call_tool(tools[call.name], args)
+                    cache[key] = prepared()
                 result = cache[key]
 
             steps.append(ToolStep(call.name, args, result=result, error=result.get("error")))
             messages.append(tool_message(call, result))
             if result.get("unavailable"):
-                unavailable = True
+                unavailable_message = result["error"]
             if "error" in result:
                 continue
 
