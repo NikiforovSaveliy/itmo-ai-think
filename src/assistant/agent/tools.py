@@ -2,10 +2,10 @@
 
 from collections.abc import Callable, Container, Mapping
 from dataclasses import dataclass, replace
-from functools import partial
+from functools import partial, wraps
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, ValidationError, ValidationInfo
 
 from assistant.graphrag.search import global_search, local_search
 from assistant.infra.erp_client import ErpClient, ErpNotFound, ErpRejected, ErpUnavailable
@@ -17,17 +17,33 @@ class Arguments(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid")
 
 
+ToolFunction = Callable[..., dict]
+ToolDecorator = Callable[[ToolFunction], ToolFunction]
+
+
+def _handle_errors(function: ToolFunction) -> ToolFunction:
+    @wraps(function)
+    def wrapped(*args, **kwargs) -> dict:
+        try:
+            return function(*args, **kwargs)
+        except Exception as exc:
+            return {"error": f"Ошибка выполнения инструмента: {exc}"}
+
+    return wrapped
+
+
 @dataclass(frozen=True)
 class Tool:
     function: Callable[..., dict]
     input_schema: type[Arguments]
     response_schema: type[BaseModel]
     description: str
+    handle_errors: ToolDecorator = _handle_errors
 
-    def prepare(self, arguments: dict) -> Callable[[], dict] | dict:
+    def prepare(self, arguments: dict, *, context: dict | None = None) -> Callable[[], dict] | dict:
         """Проверяет аргументы до подтверждения заказа или обращения к ERP."""
         try:
-            validated = self.input_schema.model_validate(arguments)
+            validated = self.input_schema.model_validate(arguments, context=context)
         except ValidationError as exc:
             return {"error": f"Неверные параметры инструмента: {exc}"}
         return partial(self._execute, validated)
@@ -37,36 +53,30 @@ class Tool:
         return prepared() if callable(prepared) else prepared
 
     def _execute(self, arguments: Arguments) -> dict:
-        params = arguments.model_dump()
-        for _ in range(3):
-            try:
-                result = self.function(**params)
-                if isinstance(result, dict) and "error" in result:
-                    return result
-                self.response_schema.model_validate(result, strict=True)
-                return result
-            except ErpUnavailable:
-                continue
-            except ErpNotFound as exc:
-                return {"error": f"Данных в ERP нет: {exc}"}
-            except ErpRejected as exc:
-                return {"error": f"ERP отклонила запрос: {exc}"}
-            except ValidationError as exc:
-                return {"error": f"Некорректный ответ инструмента: {exc}"}
-            except Exception as exc:
-                return {"error": f"Ошибка выполнения инструмента: {exc}"}
-        return {"error": "Данные ERP получить не удалось.", "unavailable": True}
+        result = self.function(**arguments.model_dump())
+        if isinstance(result, dict) and "error" in result:
+            return result
+        try:
+            self.response_schema.model_validate(result, strict=True)
+        except ValidationError as exc:
+            return {"error": f"Некорректный ответ инструмента: {exc}"}
+        return result
 
 
 _REGISTRY: dict[str, Tool] = {}
 
 
-def register_tool(input_schema: type[Arguments], response_schema: type[BaseModel]):
+def register_tool(
+    input_schema: type[Arguments], response_schema: type[BaseModel], *, handle_errors: ToolDecorator = _handle_errors
+):
     """Регистрирует функцию, принимающую контекст первым аргументом, под её именем."""
 
     def decorate(function: Callable[..., dict]) -> Callable[..., dict]:
-        _REGISTRY[function.__name__] = Tool(function, input_schema, response_schema, function.__doc__ or "")
-        return function
+        wrapped = handle_errors(function)
+        _REGISTRY[function.__name__] = Tool(
+            wrapped, input_schema, response_schema, function.__doc__ or "", handle_errors
+        )
+        return wrapped
 
     return decorate
 
@@ -116,15 +126,42 @@ def prepare_call(
         return {"error": f"Неизвестный инструмент: {name}."}
     tool = tools[name]
     if not isinstance(tool, Tool):
-        tool = replace(_REGISTRY[name], function=tool)
-    prepared = tool.prepare(arguments)
-    if callable(prepared) and "part_id" in arguments and arguments["part_id"] not in known_codes:
-        return {"error": "Номер детали не подтверждён. Сначала вызови search_knowledge."}
-    return prepared
+        registered = _REGISTRY[name]
+        tool = replace(registered, function=registered.handle_errors(tool))
+    return tool.prepare(arguments, context={"known_codes": known_codes})
+
+
+def _handle_erp_errors(function: ToolFunction) -> ToolFunction:
+    @_handle_errors
+    @wraps(function)
+    def wrapped(*args, **kwargs) -> dict:
+        for _ in range(3):
+            try:
+                return function(*args, **kwargs)
+            except ErpUnavailable:
+                continue
+            except ErpNotFound as exc:
+                return {"error": f"Данных в ERP нет: {exc}"}
+            except ErpRejected as exc:
+                return {"error": f"ERP отклонила запрос: {exc}"}
+        return {"error": "Данные ERP получить не удалось.", "unavailable": True}
+
+    return wrapped
+
+
+def _confirmed_part(part_id: str, info: ValidationInfo) -> str:
+    known_codes = (info.context or {}).get("known_codes")
+    if known_codes is not None and part_id not in known_codes:
+        raise ValueError("Номер детали не подтверждён. Сначала вызови search_knowledge.")
+    return part_id
 
 
 Question = Annotated[str, Field(pattern=r"\S", description="Вопрос для поиска по базе знаний")]
-PartId = Annotated[str, Field(pattern=r"^P-[0-9]{4}[A-Z]?$", description="Подтверждённый номер детали")]
+PartId = Annotated[
+    str,
+    Field(pattern=r"^P-[0-9]{4}[A-Z]?$", description="Подтверждённый номер детали"),
+    AfterValidator(_confirmed_part),
+]
 Warehouse = Literal["Москва", "Санкт-Петербург", "Казань", "Новосибирск"]
 
 
@@ -184,7 +221,7 @@ class StockResult(BaseModel):
     discontinued: bool
 
 
-@register_tool(StockArgs, StockResult)
+@register_tool(StockArgs, StockResult, handle_errors=_handle_erp_errors)
 def check_stock(context: _Context, part_id: str, warehouse: str) -> dict:
     """Проверить остаток детали на конкретном складе."""
     return context.erp.get_stock(part_id=part_id, warehouse=warehouse)
@@ -204,7 +241,7 @@ class PriceResult(BaseModel):
     discontinued: bool
 
 
-@register_tool(PartArgs, PriceResult)
+@register_tool(PartArgs, PriceResult, handle_errors=_handle_erp_errors)
 def get_price(context: _Context, part_id: str) -> dict:
     """Узнать цену детали в рублях."""
     return context.erp.get_price(part_id=part_id)
@@ -225,7 +262,7 @@ class OrderResult(OrderArgs):
     status: str
 
 
-@register_tool(OrderArgs, OrderResult)
+@register_tool(OrderArgs, OrderResult, handle_errors=_handle_erp_errors)
 def create_service_order(context: _Context, part_id: str, warehouse: str, qty: int, model: str) -> dict:
     """Подготовить сервисный заказ по явному запросу пользователя."""
     return context.erp.create_order(part_id=part_id, warehouse=warehouse, qty=qty, model=model)
