@@ -9,7 +9,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 from assistant.infra import schemas
 from assistant.infra.config import vocabulary
 from assistant.infra.grounding import CODE_TYPES, canonical_name, code_type, find_codes, find_names
-from assistant.infra.llm import ChatMessage, LLMClient
+from assistant.infra.llm import LLMClient
 
 _logger = logging.getLogger(__name__)
 _SYSTEM_PROMPT = """
@@ -217,13 +217,9 @@ def _unconfirmed_names(llm: LLMClient, text: str, entities: list[schemas.Entity]
         "additionalProperties": False,
     }
     prompt = _NAME_EVIDENCE_PROMPT + "\n" + json.dumps(list(candidates), ensure_ascii=False)
-    response = llm.chat(
-        [ChatMessage(role="system", content=prompt), ChatMessage(role="user", content=text)],
-        json_schema=schema,
-        max_tokens=_MAX_TOKENS,
-    )
+    content = _chat_json(llm, prompt, text, schema)
     try:
-        evidence = json.loads(response.content)
+        evidence = json.loads(content)
     except ValueError:
         evidence = {}
     if not isinstance(evidence, dict):
@@ -235,13 +231,17 @@ def _is_source_quote(quote: object, text: str) -> bool:
     return isinstance(quote, str) and any(char.isalnum() for char in quote) and quote.strip() in text
 
 
-def _call_llm(client: LLMClient, system_message: str, user_message: str) -> ExtractionResponse:
-    messages: list[ChatMessage] = [
-        ChatMessage(role="system", content=system_message),
-        ChatMessage(role="user", content=user_message),
+def _chat_json(client: LLMClient, system_message: str, user_message: str, schema: dict) -> str:
+    messages: list[dict] = [
+        {"role": "system", "content": system_message},
+        {"role": "user", "content": user_message},
     ]
-    response = client.chat(messages, json_schema=schemas.EXTRACTION_SCHEMA, max_tokens=_MAX_TOKENS)
-    return ExtractionResponse.model_validate_json(response.content)
+    return client.chat(messages, json_schema=schema, max_tokens=_MAX_TOKENS).content
+
+
+def _call_llm(client: LLMClient, system_message: str, user_message: str) -> ExtractionResponse:
+    content = _chat_json(client, system_message, user_message, schemas.EXTRACTION_SCHEMA)
+    return ExtractionResponse.model_validate_json(content)
 
 
 def _correction_prompt(system_message: str, error: ValidationError) -> str:
