@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections import Counter
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
@@ -15,6 +16,7 @@ from assistant.infra.grounding import code_type, find_codes, find_names
 from assistant.infra.llm import LLMClient
 from assistant.infra.schemas import MAP_SCHEMA, Answer, Community, Entity, KnowledgeBase, Relation
 
+_logger = logging.getLogger(__name__)
 _SINGLE_ANCHOR_DEPTH = 2
 _INTER_ANCHOR_MAX_PATH = 3
 _MAX_FACT_CHARS = 8000
@@ -66,13 +68,16 @@ _REDUCE_LINE_PROMPT = (
 
 def local_search(question: str, kb: KnowledgeBase, llm: LLMClient, *, options: SearchOptions | None = None) -> Answer:
     """Отвечает на вопрос по связям графа вокруг опорных сущностей."""
+    _logger.info("local: поиск по графу для вопроса %.120r", question)
     options = options if options is not None else SearchOptions()
     anchors = _extract_anchors(question, kb.vocabulary)
     matches = KnowledgeSearch(kb).find_by_anchors(anchors, options)
     if matches is None:
+        _logger.info("local: граф не дал ответа")
         return Answer(_NO_FACTS, refused=True)
 
     facts, sources = _format_local_facts(matches, options.max_fact_chars)
+    _logger.info("local: отобрано %d фактов для ответа", len(facts))
     if not facts:
         return Answer(_NO_FACTS, refused=True)
 
@@ -84,6 +89,7 @@ def local_search(question: str, kb: KnowledgeBase, llm: LLMClient, *, options: S
 
 def global_search(question: str, kb: KnowledgeBase, llm: LLMClient, *, options: SearchOptions | None = None) -> Answer:
     """Отвечает на обзорный вопрос по сводкам сообществ в два шага."""
+    _logger.info("global: подготовка сводок для вопроса %.120r", question)
     options = options if options is not None else SearchOptions()
     search = KnowledgeSearch(kb)
     line_names = _extract_line_names(question, kb.vocabulary)
@@ -92,7 +98,8 @@ def global_search(question: str, kb: KnowledgeBase, llm: LLMClient, *, options: 
     partials: list[str] = []
     chunk_ids = set(context.line_facts.evidence.chunk_ids)
     known_codes = set(context.line_facts.evidence.codes)
-    for summary in context.summaries:
+    for number, summary in enumerate(context.summaries, start=1):
+        _logger.info("global: map %d/%d, сообщество %s", number, len(context.summaries), summary.community.community_id)
         partial = _answer_from_summary(question, summary, context.has_scope, line_facts, llm, options)
         if partial is None:
             continue
@@ -102,8 +109,10 @@ def global_search(question: str, kb: KnowledgeBase, llm: LLMClient, *, options: 
         known_codes.update(evidence.codes)
 
     if not partials:
+        _logger.info("global: нет подходящих частичных ответов")
         return Answer(_NO_FACTS, refused=True)
 
+    _logger.info("global: reduce, объединение %d частичных ответов", len(partials))
     text = _merge_answers(question, partials, context.summaries, line_facts, llm, options.reduce_max_tokens)
     if _is_refusal(text) or fabricated_facts(text, question, known_codes, tool_text=""):
         return Answer(_NO_FACTS, refused=True)

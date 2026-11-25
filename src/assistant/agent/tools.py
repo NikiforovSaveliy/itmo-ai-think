@@ -1,5 +1,6 @@
 """Инструменты поиска и ERP для агента."""
 
+import logging
 from collections.abc import Callable, Container, Mapping
 from dataclasses import dataclass, replace
 from functools import partial, wraps
@@ -11,6 +12,8 @@ from assistant.graphrag.search import global_search, local_search
 from assistant.infra.erp_client import ErpClient, ErpNotFound, ErpRejected, ErpUnavailable
 from assistant.infra.llm import LLMClient
 from assistant.infra.schemas import KnowledgeBase
+
+_logger = logging.getLogger(__name__)
 
 
 class Arguments(BaseModel):
@@ -135,10 +138,12 @@ def _handle_erp_errors(function: ToolFunction) -> ToolFunction:
     @_handle_errors
     @wraps(function)
     def wrapped(*args, **kwargs) -> dict:
-        for _ in range(3):
+        for attempt in range(1, 4):
+            _logger.info("ERP: %s, попытка %d/3", function.__name__, attempt)
             try:
                 return function(*args, **kwargs)
             except ErpUnavailable:
+                _logger.info("ERP: %s, попытка %d/3 завершилась сбоем", function.__name__, attempt)
                 continue
             except ErpNotFound as exc:
                 return {"error": f"Данных в ERP нет: {exc}"}
