@@ -1,8 +1,10 @@
 """Цикл агента, проверки фактов и подтверждение заказа."""
 
 import json
+import logging
 import re
 from collections.abc import Callable, Mapping
+from time import monotonic
 
 from assistant.agent.tools import get_tool_schemas, prepare_call
 from assistant.infra.evaluation import has_fact
@@ -10,6 +12,7 @@ from assistant.infra.grounding import find_codes
 from assistant.infra.llm import LLMClient, tool_message
 from assistant.infra.schemas import AgentResult, ToolStep
 
+_logger = logging.getLogger(__name__)
 _NO_FACTS = "В базе знаний не найдено."
 _ORDER = "create_service_order"
 _WITH_UNIT = re.compile(r"(?<![\w-])(\d+(?:[ \u00a0\u202f]\d{3})*)\s*(руб\w*|₽|шт\w*|единиц\w*)", re.IGNORECASE)
@@ -59,6 +62,7 @@ def run_agent(
     confirm: bool = False,
 ) -> AgentResult:
     """Ведёт диалог с инструментами и проверяет действия и итоговый ответ."""
+    _logger.info("agent: вопрос %.120r, лимит инструментов %d", question, max_steps)
     messages = [
         {"role": "system", "content": _SYSTEM_PROMPT},
         {"role": "user", "content": question},
@@ -72,6 +76,9 @@ def run_agent(
     schemas = get_tool_schemas(tools)
 
     def finish(text: str, *, refused: bool = False, pending: dict | None = None) -> AgentResult:
+        _logger.info(
+            "agent: завершён после %d шагов, отказ=%s, подтверждение=%s", len(steps), refused, pending is not None
+        )
         if unavailable_message and unavailable_message.casefold() not in text.casefold():
             text = f"{text} {unavailable_message}"
         return AgentResult(
@@ -84,11 +91,13 @@ def run_agent(
         )
 
     while len(steps) < max_steps:
+        _logger.info("agent: запрос к модели, выполнено шагов %d/%d", len(steps), max_steps)
         response = llm.chat(messages, tools=schemas)
         messages.append(response.as_message())
         if not response.tool_calls:
             text = response.content.strip()
             if issues := _unsupported(text, known_codes, results):
+                _logger.info("agent: ответ отправлен модели на исправление, расхождений %d", len(issues))
                 messages.append(
                     {
                         "role": "user",
@@ -107,6 +116,8 @@ def run_agent(
         for call in response.tool_calls:
             if len(steps) >= max_steps:
                 break
+            _logger.info("agent: шаг %d/%d, инструмент %.80r", len(steps) + 1, max_steps, call.name)
+            started = monotonic()
             args = call.arguments
             prepared = prepare_call(tools, call.name, args, known_codes)
             if callable(prepared) and call.name == _ORDER:
@@ -132,10 +143,13 @@ def run_agent(
                 result = prepared
             else:
                 key = (call.name, json.dumps(args, sort_keys=True, ensure_ascii=False))
-                if key not in cache:
+                if key in cache:
+                    _logger.info("agent: повторный вызов %.80r, результат из кеша", call.name)
+                else:
                     cache[key] = prepared()
                 result = cache[key]
 
+            _logger.info("agent: шаг завершён за %.2f с, ошибка=%s", monotonic() - started, "error" in result)
             steps.append(ToolStep(call.name, args, result=result, error=result.get("error")))
             messages.append(tool_message(call, result))
             if result.get("unavailable"):
@@ -150,4 +164,5 @@ def run_agent(
             if call.name == _ORDER and result.get("order_id"):
                 return finish(f"Заказ {result['order_id']} создан.")
 
+    _logger.info("agent: достигнут лимит шагов (%d)", max_steps)
     return finish(_partial_answer(results))

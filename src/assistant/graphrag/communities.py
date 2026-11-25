@@ -1,5 +1,6 @@
 """Сообщества графа и их сводки. Требование FR-3."""
 
+import logging
 from collections import Counter
 
 import networkx as nx
@@ -7,9 +8,12 @@ import networkx as nx
 from assistant.infra.llm import SEED, LLMClient
 from assistant.infra.schemas import Community
 
+_logger = logging.getLogger(__name__)
+
 
 def detect_communities(graph: nx.DiGraph) -> list[Community]:
     """Разбивает взвешенный граф на сообщества алгоритмом Лувена."""
+    _logger.info("Разбиение графа на сообщества: узлов=%d, связей=%d", graph.number_of_nodes(), graph.number_of_edges())
     undirected = nx.MultiGraph()
     undirected.add_nodes_from(sorted(graph.nodes))
     undirected.add_weighted_edges_from(sorted(graph.edges(data="weight", default=1)))
@@ -26,6 +30,7 @@ def detect_communities(graph: nx.DiGraph) -> list[Community]:
 
 def summarize_community(community: Community, graph: nx.DiGraph, llm: LLMClient) -> str:
     """Описывает факты сообщества и рассчитанную статистику за 150 слов."""
+    _logger.info("Подготовка сводки сообщества %s", community.community_id)
     members = ", ".join(graph.nodes[node]["name"] for node in community.nodes)
     facts: list[str] = []
     counts: Counter[str] = Counter()
